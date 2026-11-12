@@ -1,5 +1,6 @@
 package main
 
+import "core:fmt"
 import "core:math/linalg"
 import "base:runtime"
 import "core:log"
@@ -14,9 +15,13 @@ Rect :: rl.Rectangle
 DEF_BG_COLOR :: rl.BLACK
 
 THINGS_MAX :: 512
-THING_PLAYER :: Thing{.Player, .Solid}
+THING_PLAYER :: Thing{.Player, {.Solid, .Texture}}
+THING_CHEST :: Thing{.Chest, {.Solid, .Texture}}
 
-PLR_SIZE :: 24
+TILE_SIZE :: 16
+
+PLR_CAM_ZOOM :: 4
+PLR_SIZE :: TILE_SIZE
 PLR_SPEED :: PLR_SIZE * 2
 
 WIN_WIDTH :: 800
@@ -40,6 +45,8 @@ main :: proc() {
 	rl.InitWindow(WIN_WIDTH, WIN_HEIGHT, WIN_TITLE)
 	defer rl.CloseWindow()
 
+	width, height := (f32)(rl.GetRenderWidth()), (f32)(rl.GetRenderHeight())
+
 	input: Input
 	// TODO: Load from file
 	input.bindings = INPUT_DEF_BINDINGS
@@ -54,10 +61,60 @@ main :: proc() {
 		body: Rect,
 		vel: Vec2,
 	}
-	solids: [512]Solid
+	solids: [THINGS_MAX]Solid
+
+	path: cstring = #directory + "../bin/assets/atlas.png"
+	ta_texture := rl.LoadTexture(path)
+	assert(ta_texture.id != 0, fmt.tprint(path))
+	texture_atlas := Texture_Atlas{
+		texture = ta_texture,
+		source = {
+			.Player = {0, 0, TILE_SIZE, TILE_SIZE},
+			.Chest1 = {0, TILE_SIZE, TILE_SIZE, TILE_SIZE},
+			.Chest2 = {TILE_SIZE, TILE_SIZE, TILE_SIZE, TILE_SIZE},
+		},
+	}
+
+	Texture :: struct {
+		id: Texture_ID,
+		flags: Texture_Flags,
+	}
+	Texture_Flags :: bit_set[enum {
+		Flip,
+	}; u8]
+	textures: [THINGS_MAX]Texture
+
+	Interactable :: struct {
+		flags: Interactable_Flags,
+		interact: proc(^Interactable, ^State_Data),
+	}
+	Interactable_Flags :: bit_set[enum {
+		Can_Interact,
+		Already_Interacted,
+	}; u8]
+	interactables: [THINGS_MAX]Interactable
+
+	plr_cam := rl.Camera2D{
+		offset={width/2, height/2},
+		zoom=PLR_CAM_ZOOM,
+	}
+
+	// TODO: Pack this into init function?
+	append(&current_state.things, THING_PLAYER)
+	plr_idx := 0
+	solids[plr_idx] = {body={width=PLR_SIZE, height=PLR_SIZE}}
+	textures[plr_idx] = {.Player, {}}
 	
-	plr_idx := append(&current_state.things, THING_PLAYER) - 1
-	solids[plr_idx]={body={width=PLR_SIZE, height=PLR_SIZE}}
+	append(&current_state.things, THING_CHEST)
+	chest_idx := 1
+	solids[chest_idx] = {body={width=TILE_SIZE, height=TILE_SIZE}}
+	textures[chest_idx] = {.Chest1, {}}
+	chest_interact_proc :: proc(self: ^Interactable, state_data: ^State_Data) {
+		self.flags -= {.Can_Interact}
+		self.flags += {.Already_Interacted}
+		log.debug("Interacted!")
+	}
+	interactables[chest_idx] = {{.Can_Interact}, chest_interact_proc}
 
 	for !rl.WindowShouldClose() {
 		dt := rl.GetFrameTime()
@@ -96,21 +153,32 @@ main :: proc() {
 
 		for thing, idx in current_state.things {
 			solid := &solids[idx]
-			for flag in Thing_Flag {
-				switch flag {
-				case .Player:
-					iv: Vec2
-					if input.state[.Up] == .Down do iv.y -= 1
-					if input.state[.Down] == .Down do iv.y += 1
-					if input.state[.Left] == .Down do iv.x -= 1
-					if input.state[.Right] == .Down do iv.x += 1
-					iv = linalg.normalize0(iv)
-					solid.vel = iv * PLR_SPEED
-					fallthrough
+			texture := &textures[idx]
+			interact := &interactables[idx]
+			#partial switch thing.id {
+			case .Player:
+				iv: Vec2
+				if input.state[.Up] == .Down do iv.y -= 1
+				if input.state[.Down] == .Down do iv.y += 1
+				if input.state[.Left] == .Down do iv.x -= 1
+				if input.state[.Right] == .Down do iv.x += 1
 
-				case .Solid:
-					solid.body.x += solid.vel.x * dt
-					solid.body.y += solid.vel.y * dt
+				if iv.x < 0 do texture.flags += {.Flip}
+				if iv.x > 0 do texture.flags -= {.Flip}
+
+				solid.vel = iv * PLR_SPEED
+			}
+			for flag in Thing_Flag {
+				#partial switch flag {
+					case .Solid:
+						solid.body.x += solid.vel.x * dt
+						solid.body.y += solid.vel.y * dt
+					case .Interactable:
+						if input.state[.Accept] == .Pressed {
+							if .Can_Interact in interact.flags {
+								interact->interact(current_state)
+							}
+						}
 				}
 			}
 		}
@@ -118,13 +186,17 @@ main :: proc() {
 		rl.BeginDrawing()
 		{
 			rl.ClearBackground(current_state.bg_color)
+			
+			rl.BeginMode2D(plr_cam)
 			for thing, idx in current_state.things {
-				if .Solid in thing {
-					solid := solids[idx]
-					size := Vec2{solid.body.width, solid.body.height}
-					rl.DrawRectanglePro(solid.body, size/2, 0, rl.RED)
+				if .Texture not_in thing.flags {
+					continue
 				}
+				solid := solids[idx]
+				texture := textures[idx]
+				rl.DrawTexturePro(texture_atlas.texture, texture_atlas.source[texture.id], solid.body, {solid.body.width/2, solid.body.height/2}, 0, rl.WHITE)
 			}
+			rl.EndMode2D()
 		}
 		rl.EndDrawing()
 	}
@@ -135,6 +207,7 @@ INPUT_DEF_BINDINGS :: [Input_Control]Input_Control_Binding{
 	.Down = {rl.KeyboardKey.S, nil},
 	.Left = {rl.KeyboardKey.A, nil},
 	.Right = {rl.KeyboardKey.D, nil},
+	.Accept = {rl.KeyboardKey.ENTER, nil},
 	.UI_Accept = {rl.MouseButton.LEFT, nil},
 	.UI_Deny = {rl.MouseButton.RIGHT, nil},
 }
@@ -149,6 +222,7 @@ Input_Control :: enum {
 	Down,
 	Left,
 	Right,
+	Accept,
 
 	UI_Accept,
 	UI_Deny,
@@ -176,10 +250,30 @@ State_Data :: struct {
 	things: [dynamic]Thing,
 }
 
-Thing :: bit_set[Thing_Flag; u8]
+Texture_Atlas :: struct {
+	texture: rl.Texture2D,
+	source: [Texture_ID]Rect,
+}
+
+Texture_ID :: enum {
+	Chest1,
+	Chest2,
+	Player,
+}
+
+Thing :: struct {
+	id: Thing_ID,
+	flags: bit_set[Thing_Flag; u8],
+}
+
+Thing_ID :: enum u8 {
+	Player,
+	Chest,
+}
 
 Thing_Flag :: enum u8 {
-	Player,
 	Solid,
+	Texture,
+	Interactable,
 }
 
